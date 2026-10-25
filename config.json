@@ -1,0 +1,13 @@
+{
+  "channel": "msedge",
+  "headless": false,
+  "max_tasks": 12,
+  "visit_seconds": 8,
+  "step_seconds": 2,
+  "max_quiz_steps": 20,
+  "timeout_ms": 30000,
+  "search_count": 20,
+  "search_interval_seconds": 15,
+  "search_terms_file": "searches.example.txt",
+  "verify_search_points": true
+}
