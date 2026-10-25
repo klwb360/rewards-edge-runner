@@ -21,7 +21,7 @@ class EdgeDailyIntegrationTests(unittest.TestCase):
         progress = types.SimpleNamespace(current_minutes=30, target_minutes=30, completed_today=True, available=True)
         edge.read_edge_progress = Mock(return_value=progress, side_effect=read_error)
 
-        def browse(context, config, state, day, *, check_page):
+        def browse(context, config, state, day, *, check_page, today):
             events.append("edge")
             state["edge_browsing"] = dict(minutes_before=5, minutes_after=30 if edge_result else 5,
                 target_minutes=30, waited_seconds=60, status="completed" if edge_result else "timeout")

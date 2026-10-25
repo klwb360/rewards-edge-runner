@@ -9,7 +9,10 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import signal
+import shutil
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -17,6 +20,7 @@ from hashlib import sha256
 from urllib.parse import urlencode, urlsplit
 
 from modern_dashboard import parse_modern_dashboard
+from runtime_context import close_preserving_error, configured_now, configured_today, validate_timezone
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +32,8 @@ DEFAULTS = dict(channel="msedge", headless=False, max_tasks=12, visit_seconds=8,
                 step_seconds=2, max_quiz_steps=20, timeout_ms=30000,
                 search_count=10, search_interval_seconds=15,
                 search_terms_file="searches.example.txt", verify_search_points=False,
-                edge_daily_enabled=False, edge_max_wait_minutes=60, edge_poll_seconds=60)
+                edge_daily_enabled=False, edge_max_wait_minutes=60, edge_poll_seconds=60,
+                timezone=None)
 
 
 class InterfaceChanged(RuntimeError):
@@ -45,6 +50,10 @@ class AlreadyRunning(RuntimeError):
 
 class SearchCreditStopped(RuntimeError):
     pass
+
+
+class Terminated(KeyboardInterrupt):
+    """SIGTERM unwinds the same browser cleanup paths as an interactive interrupt."""
 
 
 @dataclass(frozen=True)
@@ -64,6 +73,7 @@ def load_config(path: Path) -> dict:
     if not isinstance(supplied, dict) or set(supplied) - set(DEFAULTS):
         raise ValueError("配置必须是 JSON 对象，且只能使用 config.json 中的配置项。")
     config = DEFAULTS | supplied
+    validate_timezone(config['timezone'])
     if config["channel"] not in ("msedge", "chromium"):
         raise ValueError("channel 只支持 msedge 或 chromium。")
     if type(config["headless"]) is not bool:
@@ -224,7 +234,7 @@ def run_searches(context, config: dict, report: dict, day: date, progress_reader
         raise ValueError("搜索历史格式异常，已停止以防止重复提交。请检查 .state/search-history.json。")
     history = {key: history[key] for key in sorted(history)[-30:]}
     attempted = history.setdefault(day.isoformat(), [])
-    started_day = date.today()
+    started_day = day
     page = context.new_page()
     no_credit = 0
     try:
@@ -236,7 +246,7 @@ def run_searches(context, config: dict, report: dict, day: date, progress_reader
             if fingerprint in attempted:
                 summary["skipped_today"] += 1
                 continue
-            if date.today() != started_day:
+            if configured_today(config) != started_day:
                 raise InterfaceChanged("搜索过程中跨越午夜，已停止；请在新日期重新运行。")
             # Persist BEFORE navigation: process interruption must not trigger a retry storm.
             attempted.append(fingerprint)
@@ -279,7 +289,7 @@ def run_searches(context, config: dict, report: dict, day: date, progress_reader
             else:
                 logging.info("Bing 搜索页面已打开 %s/%s；积分是否到账未确认。", summary["opened"], len(terms))
     finally:
-        page.close()
+        close_preserving_error(page)
 
 
 @contextmanager
@@ -466,7 +476,8 @@ def inspect_edge_browsing(page, config: dict, report: dict) -> None:
 def run_edge_phase(context, config: dict, report: dict, day: date) -> bool:
     from edge_browsing import EdgeInterfaceChanged, run_edge_browsing
     try:
-        return run_edge_browsing(context, config, report, day, check_page=check_edge_page)
+        return run_edge_browsing(context, config, report, day, check_page=check_edge_page,
+                                today=lambda: configured_today(config))
     except EdgeInterfaceChanged as exc:
         raise InterfaceChanged(str(exc)) from exc
 
@@ -478,13 +489,18 @@ def check_edge_page(page) -> None:
         raise NeedsHuman("Edge 活动已跳转到未登录介绍页，请运行 login 手动恢复登录。")
 
 
+def browser_options(command, config):
+    options = dict(headless=config['headless'] if command != 'login' else False,
+                   accept_downloads=False, locale='zh-CN')
+    if config['channel'] == 'msedge':
+        options['channel'] = 'msedge'
+    return options
+
+
 def run_browser(command: str, config: dict, report: dict) -> int:
     from playwright.sync_api import sync_playwright
     with sync_playwright() as playwright:
-        options = dict(headless=config["headless"] if command != "login" else False,
-                       accept_downloads=False)
-        if config["channel"] == "msedge":
-            options["channel"] = "msedge"
+        options = browser_options(command, config)
         context = playwright.chromium.launch_persistent_context(str(STATE / "profile"), **options)
         context.set_default_timeout(config["timeout_ms"])
         context.on("page", lambda item: item.on("dialog", lambda dialog: dialog.dismiss()))
@@ -494,14 +510,14 @@ def run_browser(command: str, config: dict, report: dict) -> int:
             page = context.pages[0] if context.pages else context.new_page()
             if command == "login":
                 if not sys.stdin.isatty():
-                    raise NeedsHuman("login 需要交互终端，请在 PowerShell 窗口运行。")
+                    raise NeedsHuman("login 需要交互终端，请在 PowerShell 或 SSH 交互终端运行。")
                 page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
                 input("请在 Edge 中手动登录并进入 Rewards 仪表板；完成后回到此窗口按 Enter：")
                 read_dashboard(page, config["timeout_ms"], navigate=False)
                 report["status"] = "login_saved"
                 logging.info("已识别登录后的每日活动数据，会话保存在 .state/profile。")
                 return 0
-            day = date.today()
+            day = configured_today(config)
             tasks = read_task_pages(page, config["timeout_ms"], day)
             if not tasks and command == "inspect" and not config["edge_daily_enabled"]:
                 raise InterfaceChanged("没有找到本机日期对应的每日活动。可能是地区不提供、服务端日期不同或页面改版；未执行任何任务。")
@@ -544,9 +560,9 @@ def run_browser(command: str, config: dict, report: dict) -> int:
                     raise
                 finally:
                     if activity is not None:
-                        activity.close()
-                if date.today() != day:
-                    raise InterfaceChanged("运行跨越了本机午夜，已停止；请在新日期重新运行。")
+                        close_preserving_error(activity)
+                if configured_today(config) != day:
+                    raise InterfaceChanged("运行跨越了配置时区午夜，已停止；请在新日期重新运行。")
                 for verification in range(3):
                     after = read_task_pages(page, config["timeout_ms"], day)
                     result["status"] = completion_status(task, after)
@@ -576,12 +592,35 @@ def run_browser(command: str, config: dict, report: dict) -> int:
             report["status"] = "completed" if complete else "partial"
             return 0 if complete else 1
         finally:
-            context.close()
+            close_preserving_error(context)
 
 
-def main(argv=None) -> int:
+def doctor(config):
+    """Local diagnostics only: never launch a browser or access an account."""
+    from importlib.metadata import PackageNotFoundError, version
+    checks = [dict(name='Python >= 3.10', ok=sys.version_info >= (3, 10), detail=sys.version.split()[0]),
+              dict(name='timezone', ok=True, detail=config.get('timezone') or 'host-local'),
+              dict(name='browser locale', ok=True, detail='zh-CN')]
+    try:
+        dependency = version('playwright')
+    except PackageNotFoundError:
+        dependency = None
+    checks.append(dict(name='playwright', ok=dependency is not None, detail=dependency or 'missing'))
+    if config['channel'] == 'msedge':
+        candidates = [shutil.which(name) for name in ('microsoft-edge', 'microsoft-edge-stable', 'msedge')]
+        if os.name == 'nt':
+            candidates += [str(Path(os.environ.get(key, '')) / 'Microsoft/Edge/Application/msedge.exe')
+                           for key in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA')]
+        edge = next((path for path in candidates if path and Path(path).is_file()), None)
+        checks.append(dict(name='Microsoft Edge', ok=edge is not None, detail=edge or 'missing'))
+    else:
+        checks.append(dict(name='Chromium', ok=False, detail='doctor requires msedge for the supported daily workflow'))
+    return dict(ok=all(item['ok'] for item in checks), checks=checks)
+
+
+def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Microsoft Rewards 单账户网页版每日活动脚本")
-    parser.add_argument("command", choices=["login", "inspect", "run"])
+    parser.add_argument("command", choices=["login", "inspect", "run", "doctor"])
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     args = parser.parse_args(argv)
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -589,11 +628,20 @@ def main(argv=None) -> int:
                                                             backupCount=3, encoding="utf-8")]
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
     report = dict(started_at=datetime.now().astimezone().isoformat(), command=args.command, status="started", tasks=[])
+    config = DEFAULTS.copy()
     exit_code = 1
     try:
         config = load_config(args.config)
-        with run_lock(STATE / "run.lock"):
-            exit_code = run_browser(args.command, config, report)
+        report.update(started_at=configured_now(config).isoformat(), timezone=config.get('timezone'))
+        if args.command == 'doctor':
+            diagnosis = doctor(config)
+            report.update(status='diagnosed', diagnostics=diagnosis)
+            for item in diagnosis['checks']:
+                logging.info('%s: %s (%s)', item['name'], 'OK' if item['ok'] else 'MISSING', item['detail'])
+            exit_code = 0 if diagnosis['ok'] else 1
+        else:
+            with run_lock(STATE / "run.lock"):
+                exit_code = run_browser(args.command, config, report)
     except NeedsHuman as exc:
         report.update(status="needs_human", reason=str(exc))
         logging.error("%s", exc)
@@ -605,6 +653,12 @@ def main(argv=None) -> int:
     except SearchCreditStopped as exc:
         report.update(status="search_paused", reason=str(exc))
         logging.warning("%s", exc)
+    except Terminated:
+        report.update(status='interrupted', reason='收到 SIGTERM，已保留最后观察到的进度。', signal='SIGTERM')
+        if 'edge_browsing' in report:
+            report['edge_browsing'].update(status='interrupted', stopped_reason='sigterm')
+        logging.warning('%s', report['reason'])
+        exit_code = 143
     except KeyboardInterrupt:
         report.update(status="interrupted", reason="用户中断了本次运行，已保留最后观察到的进度。")
         logging.warning("%s", report["reason"])
@@ -616,11 +670,31 @@ def main(argv=None) -> int:
         # Playwright exceptions may contain navigation URLs. Keep them out of saved logs.
         report.update(status="error", reason=f"{type(exc).__name__}: 浏览器启动或操作失败，请检查网络、Edge 和页面兼容性。")
         logging.error("%s", report["reason"])
-    report.update(finished_at=datetime.now().astimezone().isoformat(), exit_code=exit_code)
-    target = LOGS / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".json")
+    report.update(finished_at=configured_now(config).isoformat(), exit_code=exit_code)
+    target = LOGS / (configured_now(config).strftime("%Y%m%d-%H%M%S-%f") + ".json")
     target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("报告: %s", target)
+    for handler in handlers:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
     return exit_code
+
+
+def main(argv=None) -> int:
+    previous_umask = os.umask(0o077) if os.name != 'nt' else None
+    install_handler = threading.current_thread() is threading.main_thread()
+    previous = signal.getsignal(signal.SIGTERM) if install_handler else None
+    def stop(signum, frame):
+        raise Terminated()
+    try:
+        if install_handler:
+            signal.signal(signal.SIGTERM, stop)
+        return _main(argv)
+    finally:
+        if install_handler:
+            signal.signal(signal.SIGTERM, previous)
+        if previous_umask is not None:
+            os.umask(previous_umask)
 
 
 if __name__ == "__main__":

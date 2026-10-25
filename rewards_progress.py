@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 import re
 
+from runtime_context import close_preserving_error
+
 
 EARN_URL = "https://rewards.bing.com/earn"
 _SEARCH_COUNTER = re.compile(r"必应搜索\s*(-?\d+)\s*/\s*(-?\d+)")
@@ -62,4 +64,4 @@ def read_search_progress(context, timeout_ms: int = 30000) -> SearchProgress:
         expect(dialog).to_contain_text(_SEARCH_COUNTER, timeout=timeout_ms)
         return parse_search_progress(dialog.inner_text(timeout=timeout_ms))
     finally:
-        page.close()
+        close_preserving_error(page)

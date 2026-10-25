@@ -1,5 +1,6 @@
 {
   "channel": "msedge",
+  "timezone": "Asia/Shanghai",
   "headless": false,
   "max_tasks": 12,
   "visit_seconds": 8,

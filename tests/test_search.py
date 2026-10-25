@@ -75,7 +75,8 @@ class SearchBrowserTests(unittest.TestCase):
             else:
                 route.abort()
 
-        with patch.object(rewards, "ROOT", root), patch.object(rewards, "STATE", state):
+        with patch.object(rewards, "ROOT", root), patch.object(rewards, "STATE", state), \
+             patch.object(rewards, "configured_today", return_value=date(2026, 10, 25)):
             with sync_playwright() as playwright:
                 context = playwright.chromium.launch(headless=True, channel="msedge").new_context()
                 context.route("**/*", intercept)
