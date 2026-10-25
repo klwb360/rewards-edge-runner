@@ -60,12 +60,11 @@ def _normalize_item(item) -> dict | None:
     }
 
 
-def parse_modern_dashboard(scripts: list[str]) -> dict | None:
-    """Decode JSON push arguments and Flight records without evaluating page code.
+def decode_flight_records(scripts: list[str], *, strict: bool = False) -> list:
+    """Decode data records only; never evaluate the surrounding JavaScript.
 
-    ``None`` means neither supported activity schema was found. Earn-page cards
-    have no assumed date and are returned separately when that schema exists.
-    Account data and activity hashes are deliberately excluded from the result.
+    React's non-JSON control records are ignored. Strict callers can distinguish
+    malformed data from a supported model which simply lacks an optional feature.
     """
     decoder = json.JSONDecoder(parse_constant=_reject_constant)
     chunks = []
@@ -76,26 +75,45 @@ def parse_modern_dashboard(scripts: list[str]) -> dict | None:
             try:
                 argument, end = decoder.raw_decode(script, match.end())
             except (ValueError, RecursionError):
+                if strict:
+                    raise ValueError('Malformed Flight push argument') from None
                 continue
             if not script[end:].lstrip().startswith(')'):
+                if strict:
+                    raise ValueError('Flight push argument is not standalone JSON')
                 continue
             if (isinstance(argument, list) and len(argument) == 2
                     and type(argument[0]) is int and argument[0] == 1
                     and isinstance(argument[1], str)):
                 chunks.append(argument[1])
+            elif strict and isinstance(argument, list) and argument and argument[0] == 1:
+                raise ValueError('Malformed Flight data frame')
+
+    values = []
+    for line in ''.join(chunks).splitlines():
+        record = _RECORD.fullmatch(line)
+        if record is None:
+            continue
+        payload = record.group(1)
+        # Module, preload, text, and other typed Flight control records are not JSON.
+        if payload and payload[0].isupper():
+            continue
+        try:
+            values.append(json.loads(payload, parse_constant=_reject_constant))
+        except (ValueError, RecursionError):
+            if strict:
+                raise ValueError('Malformed Flight JSON record') from None
+    return values
+
+
+def parse_modern_dashboard(scripts: list[str]) -> dict | None:
+    """Read daily-set and earn cards, copying no account data or activity hashes."""
 
     found = False
     found_activities = False
     promotions = {}
     activities = []
-    for line in ''.join(chunks).splitlines():
-        record = _RECORD.fullmatch(line)
-        if record is None:
-            continue
-        try:
-            value = json.loads(record.group(1), parse_constant=_reject_constant)
-        except (ValueError, RecursionError):
-            continue
+    for value in decode_flight_records(scripts):
         for daily in _item_lists(value, 'dailySetItems'):
             found = True
             for item in daily:
