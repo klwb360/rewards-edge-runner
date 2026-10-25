@@ -2,6 +2,8 @@
 
 适用环境：Windows、已安装的 Microsoft Edge、Python 3.10 及以上、单个个人 Rewards 账户。双击项目中的 `Rewards.bat` 打开菜单，也可在项目目录的 PowerShell 中使用下列命令。
 
+Ubuntu/Debian 服务器请使用 [Linux 部署指南](LINUX_DEPLOYMENT.md)。两个平台共用 Python 核心和报告格式；Windows 保留现有 BAT 菜单。
+
 ## 首次使用
 
 1. 双击 `Rewards.bat`，选择安装环境，或运行 `.\Rewards.bat setup`。
@@ -54,7 +56,9 @@ Edge 的本地计时只控制最长等待时间，任务完成以页面返回的
 .\Rewards.bat schedule-show
 ```
 
-时间采用本机时间。电脑必须开机且当前 Windows 用户已登录；任务不会自动开机或唤醒电脑，电池供电时也可能跳过。任务使用当前用户普通权限。新安装或显式更新后的总运行时限为 120 分钟，为 Edge 长阶段保留余量；已有计划需要重新执行安装命令才会更新时限。
+时间采用 `config.json` 中的 `timezone`；随附配置为 `Asia/Shanghai`，默认 20:00 即北京时间 20:00。旧配置省略时区或使用 `null` 时沿用本机时间。日期选择、搜索历史、跨日检查和 JSON 报告也使用同一时区，不修改 Windows 系统时区。Windows 每日触发器使用固定时差；安装时拒绝有季节性时差变化的时区，避免夏令时后静默偏移；`Asia/Shanghai` 和 `UTC` 可用。
+
+电脑必须开机且当前 Windows 用户已登录；任务不会自动开机或唤醒电脑，电池供电时也可能跳过。任务使用当前用户普通权限。新安装或显式更新后的总运行时限为 120 分钟，为 Edge 长阶段保留余量；已有计划需要重新执行安装命令才会更新时限。
 
 ```powershell
 .\Rewards.bat schedule-remove
@@ -85,12 +89,14 @@ MSN 桌面阅读已做过一次有限测试：同一独立 Edge 会话依次打�
 | `2` | 需要人工登录或验证；执行 `login`，完成后再检查 |
 | `3` | 页面结构或日期数据不兼容；保存报告，核对日期和实际页面后再适配 |
 | `130` | 用户中断；报告保留最后实际观察到的进度，可稍后检查再运行 |
+| `143` | 收到 SIGTERM；报告保留最后观察结果，Linux 停止服务时使用此退出码 |
 
 ```powershell
 .\Rewards.bat logs     # 查看日志目录
 .\Rewards.bat config   # 编辑配置
 .\Rewards.bat guide    # 查看本流程
 .\Rewards.bat help     # 查看支持的命令
+.\Rewards.bat doctor   # 本机配置、依赖及 Edge 位置检查，不启动浏览器
 ```
 
 每次运行的 JSON 报告和滚动日志保存在 `.logs/`。缺少 Python/依赖时先执行 `setup`；页面改变或持续不计分时保留报告，不清空历史反复尝试。微软禁止通过机器人、宏等自动方式获取 Rewards 积分，使用脚本可能导致账户限制或积分失效，规则说明见项目 [README](../README.md)。

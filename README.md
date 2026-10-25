@@ -1,10 +1,12 @@
 # Microsoft Rewards 每日任务脚本
 
-Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识别的网页版每日活动、常见测验/投票，执行并核验 Bing 搜索和 Edge 浏览分钟任务；提供 Windows 每日定时任务。
+Windows / Ubuntu / Debian + Microsoft Edge + Python。支持单账户：尝试处理已识别的网页版每日活动、常见测验/投票，执行并核验 Bing 搜索和 Edge 浏览分钟任务；提供 Windows 计划任务及 Linux systemd 用户定时器。
 
 本项目为非微软官方的本地工具。公开仓库仅包含程序、示例配置、测试和操作说明，不包含登录会话、私人搜索词及个人实测记录。
 
 双击 **`Rewards.bat`** 打开中文菜单。完整使用步骤见[本机操作流程](docs/OPERATION_GUIDE.md)。
+
+Linux 服务器使用 **`Rewards.sh`**，完整部署步骤见 [Linux 服务器部署指南](docs/LINUX_DEPLOYMENT.md)。随附配置按北京时间每天 20:00 调度；安装定时器后才会启用每日运行。
 
 **使用前了解规则：**微软将机器人、宏及其他自动获取 Rewards 积分的方式列为违规行为，可能限制账户或使积分失效。本脚本无法保证计分、保持连续记录或避免账户限制。[官方账户政策](https://support.microsoft.com/en-us/accounts-billing/rewards/getting-the-most-out-of-microsoft-rewards)、[Microsoft 服务协议](https://www.microsoft.com/zh-cn/servicesagreement)。
 
@@ -45,6 +47,7 @@ Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识�
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
 | `channel` | `msedge` | 调用已安装的 Edge |
+| `timezone` | `Asia/Shanghai` | 任务日期、历史、报告和每日调度时区；旧配置省略或使用 `null` 时沿用本机时区 |
 | `headless` | `false` | 显示浏览器；设为 `true` 后在后台运行。`login` 始终显示窗口 |
 | `max_tasks` | `12` | 每次最多尝试的网页活动数 |
 | `visit_seconds` | `8` | 打开活动后的等待时间 |
@@ -69,6 +72,8 @@ Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识�
 
 ## Edge 浏览分钟
 
+浏览器页面语言显式设为 `zh-CN`，积分读取支持当前中文页面。`doctor` 只检查本机配置、依赖和浏览器位置，不启动浏览器或检查真实积分。
+
 每日顺序为网页活动、Bing 搜索、Edge 浏览核验。启用该阶段要求 `channel: msedge`、`headless: false`；首次使用请按[微软任务说明](https://rewards.bing.com/promo/edge-browsing-streak)登录 Edge 的个人 Microsoft 账户。网页登录和浏览器账户登录可能需要分别完成。
 
 程序先读取账户实际分钟和今日完成标记。已满且已确认时直接跳过；未满时打开官方浏览入口，保持可见 Edge，允许正常浏览，每隔配置时间从后台观察页重新核验。程序不会反复抢占焦点。只有页面确认今日完成且分钟达到目标，才报告完成；本地等待够 30 分钟或 60 分钟都不算完成证据。
@@ -92,6 +97,8 @@ Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识�
 启用 Edge 阶段后，报告增加 `edge_browsing`：包含 `minutes_before`、`minutes_after`、`target_minutes`、`completed_before`、`completed_after`、`waited_seconds`、`status` 和 `stopped_reason`。BAT 会显示分钟、今日标记及等待时长。任一启用阶段未确认成功，其他阶段的完成不会覆盖它。
 
 ## 日志、查看和移除
+
+Linux 每次浏览器调用使用自己的 Xvfb/Openbox；首次通过只监听 `127.0.0.1` 的 VNC 和 SSH 隧道手动登录。运行使用普通用户，私有文件不加入 Git。Linux 虚拟桌面可运行不代表 Edge 浏览积分已获确认，详情及验收边界见部署指南。
 
 `.logs/rewards.log` 保存滚动日志；每次运行产生一份 JSON 报告，含任务状态和搜索数量。报告不保存 Cookie、密码或完整搜索 URL。
 
