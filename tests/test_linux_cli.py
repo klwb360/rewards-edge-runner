@@ -19,7 +19,7 @@ class LinuxCliTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         (self.root / "config.json").write_text("{}", encoding="utf-8")
         (self.root / "requirements.txt").write_text("playwright==1.64.1\n", encoding="utf-8")
 
@@ -58,6 +58,37 @@ class LinuxCliTests(unittest.TestCase):
                 result, _ = self.invoke([command])
                 self.assertEqual(result, 3)
                 self.assertEqual(events, [("enter", self.root / ".state", {"vnc": command == "login", "vnc_port": 5901}), [command, "--config", str(self.root / "config.json")], "exit"])
+
+    def test_directory_alias_uses_canonical_state_config_and_venv_paths(self):
+        alias = self.root / "project-alias"
+        try:
+            alias.symlink_to(self.root, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            # This still exercises real path normalization on Windows hosts
+            # where the user cannot create symlinks, without skipping coverage.
+            nested = self.root / "nested"
+            nested.mkdir()
+            alias = nested / ".."
+        else:
+            self.addCleanup(alias.unlink)
+        state_paths, core_arguments, setup_arguments = [], [], []
+
+        @contextmanager
+        def desktop(state_dir, **kwargs):
+            state_paths.append(state_dir)
+            yield {}
+
+        def core(argv):
+            core_arguments.append(argv)
+            return 3
+
+        with patch.object(cli, "require_user"), patch.dict(sys.modules, {"linux_desktop": SimpleNamespace(virtual_desktop=desktop)}), patch.object(cli, "core_main", core):
+            self.assertEqual(cli.main(["inspect"], project_root=alias), 3)
+        with patch.object(cli, "find_edge", return_value="/usr/bin/microsoft-edge"), patch.object(cli.subprocess, "run", side_effect=lambda argv, **kw: setup_arguments.append(argv) or subprocess.CompletedProcess(argv, 0)), redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.setup(alias), 0)
+        self.assertEqual(state_paths, [self.root / ".state"])
+        self.assertEqual(core_arguments, [["inspect", "--config", str(self.root / "config.json")]])
+        self.assertEqual(setup_arguments, [[sys.executable, "-m", "venv", str(self.root / ".venv")], [str(self.root / ".venv/bin/python"), "-m", "pip", "install", "--requirement", str(self.root / "requirements.txt")]])
 
     def test_core_exception_still_tears_down_desktop(self):
         events = []

@@ -35,7 +35,8 @@ class LinuxDesktopTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory(prefix="virtual-desktop-test-")
         self.addCleanup(self.folder.cleanup)
-        self.state = Path(self.folder.name) / "state"
+        # Windows CI can return an 8.3 alias for the temporary parent directory.
+        self.state = Path(self.folder.name).resolve() / "state"
         self.started = []
         self.signals = []
         self.patches = [
