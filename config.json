@@ -9,5 +9,8 @@
   "search_count": 20,
   "search_interval_seconds": 15,
   "search_terms_file": "searches.example.txt",
-  "verify_search_points": true
+  "verify_search_points": true,
+  "edge_daily_enabled": true,
+  "edge_max_wait_minutes": 60,
+  "edge_poll_seconds": 60
 }

@@ -60,6 +60,12 @@ function Format-RewardsValue($Value) {
     return [string]$Value
 }
 
+function Format-RewardsCompletion($Value) {
+    if ($Value -isnot [bool]) { return '未核验' }
+    if ($Value) { return '已完成' }
+    return '未完成'
+}
+
 function Write-RewardsRunReport($Report) {
     $data = $Report.Data
     Write-Host ('运行时间：{0}' -f $Report.StartedAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz'))
@@ -68,9 +74,10 @@ function Write-RewardsRunReport($Report) {
         Write-Host '注意：这是历史运行报告，不能代表今天的任务状态。' -ForegroundColor Yellow
     }
     $labels = @{
-        completed = '已识别的任务和搜索流程正常结束'; partial = '部分任务未确认完成'
+        completed = '本次全部启用阶段正常结束'; partial = '部分任务未确认完成'
         needs_human = '需要手动登录或验证'; interface_changed = '页面或日期数据不兼容'
         search_paused = '搜索计分暂停，已停止'; error = '运行出错'; started = '尚无结束结果'
+        interrupted = '用户已中断运行'
     }
     $statusLabel = $labels[[string]$data.status]
     if (-not $statusLabel) { $statusLabel = '报告中的状态' }
@@ -83,6 +90,22 @@ function Write-RewardsRunReport($Report) {
         if ($item.status -notin @('completed', 'already_completed')) {
             Write-Host ('  {0}：{1}' -f $item.status, $item.title)
         }
+    }
+    $edge = $data.edge_browsing
+    if ($null -ne $edge) {
+        $edgeLabels = @{
+            already_completed = '执行前页面已确认完成'; completed = '页面已确认完成'
+            pending = '今日尚未确认完成'; checking = '正在读取页面进度'; waiting = '正在等待页面确认'
+            timeout = '等待达到上限，页面仍未确认完成'; unavailable = '当前页面未提供此任务'
+            interface_changed = '页面或日期数据不兼容，未确认完成'
+            interrupted = '用户已中断，未确认完成'; error = '阶段运行出错，未确认完成'
+        }
+        $edgeLabel = $edgeLabels[[string]$edge.status]
+        if (-not $edgeLabel) { $edgeLabel = '报告中的阶段状态' }
+        Write-Host ('Edge 浏览阶段：{0}（{1}）。' -f $edgeLabel, (Format-RewardsValue $edge.status))
+        Write-Host ('Edge 页面分钟进度：{0}/{2} → {1}/{2}。' -f (Format-RewardsValue $edge.minutes_before), (Format-RewardsValue $edge.minutes_after), (Format-RewardsValue $edge.target_minutes))
+        Write-Host ('Edge 页面完成标记：{0} → {1}；本轮等待 {2} 秒。' -f (Format-RewardsCompletion $edge.completed_before), (Format-RewardsCompletion $edge.completed_after), (Format-RewardsValue $edge.waited_seconds))
+        Write-Host ('Edge 停止原因：{0}' -f (Format-RewardsValue $edge.stopped_reason))
     }
     $search = $data.searches
     if ($null -eq $search) {
@@ -225,6 +248,7 @@ function Invoke-RewardsLauncher([string]$Action = 'menu', [string]$At = '20:00')
         $code = Invoke-RewardsAction $Action $At
         if ($code -eq 2) { Write-Host '需要手动登录或验证，请执行 Rewards.bat login；程序不会自动重试验证码。' -ForegroundColor Yellow }
         elseif ($code -eq 3) { Write-Host '页面或日期数据发生变化，请查看报告和操作说明。' -ForegroundColor Yellow }
+        elseif ($code -eq 130) { Write-Host '用户已中断本次运行（退出码 130）。请用 Rewards.bat report 查看已保存的进度；程序不会自动重试。' -ForegroundColor Yellow }
         elseif ($code -ne 0) { Write-Host '操作未完全成功。环境问题请用 setup，登录问题请用 login，运行结果请用 report 查看。' -ForegroundColor Yellow }
         return [int]$code
     }

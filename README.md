@@ -1,6 +1,6 @@
 # Microsoft Rewards 每日任务脚本
 
-Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识别的网页版每日活动、常见测验/投票，并按配置执行 Bing 搜索；提供 Windows 每日定时任务。
+Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识别的网页版每日活动、常见测验/投票，执行并核验 Bing 搜索和 Edge 浏览分钟任务；提供 Windows 每日定时任务。
 
 本项目为非微软官方的本地工具。公开仓库仅包含程序、示例配置、测试和操作说明，不包含登录会话、私人搜索词及个人实测记录。
 
@@ -34,7 +34,7 @@ Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识�
 
 首次登录时，手动处理密码、双重验证、验证码和 Rewards 加入操作。请进入显示个人任务的仪表板后再按 Enter。脚本使用 `.state/profile`，和你平常的 Edge 配置独立。会话过期后需要再次运行 `login`。
 
-不带参数的 BAT 打开交互菜单；带命令参数时直接执行并返回退出码。`setup` 安装依赖，`login` 需要人工登录，`inspect` 只读取任务，`run` 执行网页活动和搜索。查看报告、日志、配置、流程和计划任务分别使用 `report`、`logs`、`config`、`guide` 和 `schedule-show`。`help` 显示全部命令。原来的 Python/PowerShell 入口继续可用。
+不带参数的 BAT 打开交互菜单；带命令参数时直接执行并返回退出码。`setup` 安装依赖，`login` 需要人工登录，`inspect` 只读取任务，`run` 执行网页活动、搜索和已启用的 Edge 浏览阶段。查看报告、日志、配置、流程和计划任务分别使用 `report`、`logs`、`config`、`guide` 和 `schedule-show`。`help` 显示全部命令。原来的 Python/PowerShell 入口继续可用。
 
 定时任务使用当前 Windows 用户的普通权限，仅在电脑运行且用户已登录时执行。默认可能在电池供电时跳过，不会开机或唤醒电脑。移动本目录后，需要从旧目录移除任务，再从新目录安装。
 
@@ -55,14 +55,27 @@ Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识�
 | `search_interval_seconds` | `15` | 搜索页面等待时间；不是微软计分保证 |
 | `search_terms_file` | `searches.example.txt` | UTF-8 文件，每行一个搜索词 |
 | `verify_search_points` | `true` | 从“今日积分”的明细读取必应搜索进度；满额或连续两次没有计分时停止 |
+| `edge_daily_enabled` | `true` | 每日运行在搜索后检查 Edge 浏览分钟，已完成时直接跳过 |
+| `edge_max_wait_minutes` | `60` | Edge 阶段最多等待 60 分钟；超时仍未确认则记录未完成 |
+| `edge_poll_seconds` | `60` | 等待期间每 60 秒重新读取实际分钟及今日完成标记 |
 
-旧配置省略 `verify_search_points` 时，沿用不核验积分的兼容模式；建议保留随附配置中的 `true`。
+旧配置省略 `verify_search_points` 时，沿用不核验积分的兼容模式；省略 `edge_daily_enabled` 时不启动 Edge 阶段。建议按需使用随附配置。
 
 `searches.example.txt` 是示例主题。建议复制成 `searches.txt`，换成你关注的内容，并修改 `search_terms_file`。空行和 `#` 开头的注释会忽略，重复搜索词会合并。如果词条不足，不会重复填满次数。程序按日期从文件轮换选词，不生成随机搜索词。
 
 配置文件中的搜索词会在提交前写入当天历史，再运行会跳过。网络失败或中断的搜索当天也不会自动重试；更换搜索词文件可能增加当天的新搜索。历史仅保存搜索词哈希，保留最近约 30 个运行日期，不保存完整词条或搜索 URL。
 
 开启 `verify_search_points` 时，脚本通过 Bing 搜索框填写并提交搜索词，每次等待后，从 Rewards 页面打开“今日积分 → 积分明细”读取实际搜索进度。积分满额后立即停止；连续两次搜索没有观察到积分增加时，以 `search_paused` 停止。不会为了凑够次数继续提交。这里读取的是当前账户显示的上限，不假定所有账户都有 60 分或每次都计 3 分。
+
+## Edge 浏览分钟
+
+每日顺序为网页活动、Bing 搜索、Edge 浏览核验。启用该阶段要求 `channel: msedge`、`headless: false`；首次使用请按[微软任务说明](https://rewards.bing.com/promo/edge-browsing-streak)登录 Edge 的个人 Microsoft 账户。网页登录和浏览器账户登录可能需要分别完成。
+
+程序先读取账户实际分钟和今日完成标记。已满且已确认时直接跳过；未满时打开官方浏览入口，保持可见 Edge，允许正常浏览，每隔配置时间从后台观察页重新核验。程序不会反复抢占焦点。只有页面确认今日完成且分钟达到目标，才报告完成；本地等待够 30 分钟或 60 分钟都不算完成证据。
+
+搜索仅因连续未计分而暂停时，仍继续检查 Edge，并保留整轮的部分失败状态。登录失效、验证码、跨日或页面不兼容会停止。Edge 超时或任务不可用返回部分未完成；Ctrl+C 保存最后观察到的进度，退出码为 `130`。
+
+长阶段可能额外等待最多 60 分钟。新安装或显式更新的计划任务总时限为 120 分钟，运行时间仍由 `-At` 决定。已有计划需要再次执行 `schedule-install` 才会采用新时限，程序不会自动修改现有计划。
 
 ## 完成判断与兼容范围
 
@@ -74,7 +87,9 @@ Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识�
 
 原生手机签到、手机阅读、Xbox 实际游戏、购买和兑换任务不在当前范围内。导航遇到不支持的外部域名会停止。验证码、登录失效或账户验证需要手动处理。
 
-**Bing 搜索按可观察到的进度记录结果。**开启积分核验时，JSON 中的 `quota_before`、`quota_after` 和 `observed_points_gained` 保存页面显示的进度变化，观察到增加时 `searches.credit` 为 `observed`。关闭核验的兼容模式只记录页面打开，积分状态保持 `unverified`。顶层 `completed` 表示已识别的活动和本次搜索流程正常结束；是否达到搜索上限需查看 `quota_after` 和 `stopped_reason`。
+**Bing 搜索按可观察到的进度记录结果。**开启积分核验时，JSON 中的 `quota_before`、`quota_after` 和 `observed_points_gained` 保存页面显示的进度变化，观察到增加时 `searches.credit` 为 `observed`。关闭核验的兼容模式只记录页面打开，积分状态保持 `unverified`。顶层 `completed` 表示本次全部启用阶段正常结束；是否达到搜索上限需查看 `quota_after` 和 `stopped_reason`。
+
+启用 Edge 阶段后，报告增加 `edge_browsing`：包含 `minutes_before`、`minutes_after`、`target_minutes`、`completed_before`、`completed_after`、`waited_seconds`、`status` 和 `stopped_reason`。BAT 会显示分钟、今日标记及等待时长。任一启用阶段未确认成功，其他阶段的完成不会覆盖它。
 
 ## 日志、查看和移除
 
@@ -89,7 +104,7 @@ Windows + 本机 Microsoft Edge + Python。支持单账户：尝试处理已识�
 | `needs_human` | 需要登录或验证，已停止 |
 | `failed` | 浏览器操作失败，已停止 |
 
-退出码：`0` 为登录/检查成功，或每日活动已确认且搜索流程正常结束；`1` 为部分未完成、搜索暂未计分而停止或运行错误；`2` 为需要人工登录/验证；`3` 为页面/日期数据不兼容。
+退出码：`0` 为登录/检查成功，或全部启用阶段正常结束；`1` 为部分未完成、计分暂停、Edge 等待超时或运行错误；`2` 为需要人工登录/验证；`3` 为页面/日期数据不兼容；`130` 为用户中断且已保存观察结果。
 
 ```powershell
 # 查看任务及上次运行结果

@@ -27,7 +27,8 @@ EARN_URL = "https://rewards.bing.com/earn"
 DEFAULTS = dict(channel="msedge", headless=False, max_tasks=12, visit_seconds=8,
                 step_seconds=2, max_quiz_steps=20, timeout_ms=30000,
                 search_count=10, search_interval_seconds=15,
-                search_terms_file="searches.example.txt", verify_search_points=False)
+                search_terms_file="searches.example.txt", verify_search_points=False,
+                edge_daily_enabled=False, edge_max_wait_minutes=60, edge_poll_seconds=60)
 
 
 class InterfaceChanged(RuntimeError):
@@ -69,9 +70,14 @@ def load_config(path: Path) -> dict:
         raise ValueError("headless 必须为 true 或 false。")
     if type(config["verify_search_points"]) is not bool:
         raise ValueError("verify_search_points 必须为 true 或 false。")
+    if type(config["edge_daily_enabled"]) is not bool:
+        raise ValueError("edge_daily_enabled 必须为 true 或 false。")
+    if config["edge_daily_enabled"] and (config["channel"] != "msedge" or config["headless"]):
+        raise ValueError("Edge 浏览任务需要 channel=msedge 且 headless=false，请使用可见的 Edge。")
     limits = {"max_tasks": (1, 30), "visit_seconds": (1, 60), "step_seconds": (1, 15),
               "max_quiz_steps": (1, 50), "timeout_ms": (5000, 120000),
-              "search_count": (0, 40), "search_interval_seconds": (5, 120)}
+              "search_count": (0, 40), "search_interval_seconds": (5, 120),
+              "edge_max_wait_minutes": (1, 60), "edge_poll_seconds": (1, 300)}
     for name, (low, high) in limits.items():
         if type(config[name]) is not int or not low <= config[name] <= high:
             raise ValueError(f"{name} 必须是 {low} 到 {high} 之间的整数。")
@@ -436,6 +442,42 @@ def restrict_navigation(route) -> None:
     route.fallback()
 
 
+def inspect_edge_browsing(page, config: dict, report: dict) -> None:
+    from edge_browsing import EdgeInterfaceChanged, read_edge_progress
+    try:
+        progress = read_edge_progress(page, config["timeout_ms"], check_edge_page)
+    except EdgeInterfaceChanged as exc:
+        raise InterfaceChanged(str(exc)) from exc
+    available = progress is not None and progress.available
+    current = progress.current_minutes if available else None
+    target = progress.target_minutes if available else None
+    completed = progress.completed_today if available else None
+    status = "unavailable" if not available else (
+        "already_completed" if completed and current >= target else "pending")
+    report["edge_browsing"] = dict(minutes_before=current, minutes_after=current,
+        target_minutes=target, completed_before=completed, completed_after=completed,
+        waited_seconds=0, status=status, stopped_reason="inspection_only")
+    if available:
+        logging.info("Edge 浏览进度 %s/%s 分钟，今日完成标记 %s；本次仅检查。", current, target, completed)
+    else:
+        logging.warning("当前账户没有可用的 Edge 浏览任务；本次仅检查。")
+
+
+def run_edge_phase(context, config: dict, report: dict, day: date) -> bool:
+    from edge_browsing import EdgeInterfaceChanged, run_edge_browsing
+    try:
+        return run_edge_browsing(context, config, report, day, check_page=check_edge_page)
+    except EdgeInterfaceChanged as exc:
+        raise InterfaceChanged(str(exc)) from exc
+
+
+def check_edge_page(page) -> None:
+    check_page(page)
+    location = urlsplit(page.url)
+    if location.hostname in {"rewards.bing.com", "rewards.microsoft.com"} and location.path.rstrip("/") == "/about":
+        raise NeedsHuman("Edge 活动已跳转到未登录介绍页，请运行 login 手动恢复登录。")
+
+
 def run_browser(command: str, config: dict, report: dict) -> int:
     from playwright.sync_api import sync_playwright
     with sync_playwright() as playwright:
@@ -461,10 +503,10 @@ def run_browser(command: str, config: dict, report: dict) -> int:
                 return 0
             day = date.today()
             tasks = read_task_pages(page, config["timeout_ms"], day)
-            if not tasks and command == "inspect":
+            if not tasks and command == "inspect" and not config["edge_daily_enabled"]:
                 raise InterfaceChanged("没有找到本机日期对应的每日活动。可能是地区不提供、服务端日期不同或页面改版；未执行任何任务。")
             if not tasks:
-                report["reason"] = "未找到本机日期对应的每日活动；仅运行配置的 Bing 搜索。"
+                report["reason"] = "未找到本机日期对应的网页活动；继续检查配置的其他阶段。"
                 logging.warning("%s", report["reason"])
             for task in tasks:
                 report["tasks"].append(dict(offer_id=task.offer_id, title=task.title, kind=task.kind,
@@ -474,6 +516,8 @@ def run_browser(command: str, config: dict, report: dict) -> int:
                 report["status"] = "inspected"
                 for item in report["tasks"]:
                     logging.info("%s | %s | %s", item["status"], item["kind"], item["title"])
+                if config["edge_daily_enabled"]:
+                    inspect_edge_browsing(page, config, report)
                 return 0
             attempts = 0
             for task, result in zip(tasks, report["tasks"]):
@@ -515,8 +559,20 @@ def run_browser(command: str, config: dict, report: dict) -> int:
             if config["verify_search_points"] and config["search_count"]:
                 from rewards_progress import read_search_progress
                 progress_reader = lambda: read_search_progress(context, config["timeout_ms"])
-            run_searches(context, config, report, day, progress_reader=progress_reader)
-            complete = bool(tasks) and all(item["status"] in {"completed", "already_completed"} for item in report["tasks"])
+            search_ok = True
+            try:
+                run_searches(context, config, report, day, progress_reader=progress_reader)
+            except SearchCreditStopped as exc:
+                if not config["edge_daily_enabled"] or report.get("searches", {}).get("stopped_reason") != "no_credit":
+                    raise
+                search_ok = False
+                report["reason"] = str(exc)
+                logging.warning("%s 将继续检查 Edge 浏览任务。", exc)
+            edge_ok = True
+            if config["edge_daily_enabled"]:
+                edge_ok = run_edge_phase(context, config, report, day)
+            complete = bool(tasks) and search_ok and edge_ok and all(
+                item["status"] in {"completed", "already_completed"} for item in report["tasks"])
             report["status"] = "completed" if complete else "partial"
             return 0 if complete else 1
         finally:
@@ -549,6 +605,10 @@ def main(argv=None) -> int:
     except SearchCreditStopped as exc:
         report.update(status="search_paused", reason=str(exc))
         logging.warning("%s", exc)
+    except KeyboardInterrupt:
+        report.update(status="interrupted", reason="用户中断了本次运行，已保留最后观察到的进度。")
+        logging.warning("%s", report["reason"])
+        exit_code = 130
     except (AlreadyRunning, ValueError, OSError) as exc:
         report.update(status="error", reason=str(exc))
         logging.error("%s", exc)

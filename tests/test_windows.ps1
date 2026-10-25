@@ -95,7 +95,7 @@ Assert-MockBindings
 Assert-True ($script:TaskWrites -eq 1) 'Expected one mocked registration.'
 $task = $script:Registration
 Assert-True ($task.Principal.LogonType -eq 'Interactive' -and $task.Principal.RunLevel -eq 'Limited') 'Unexpected task principal.'
-Assert-True ($task.Settings.MultipleInstances -eq 'IgnoreNew' -and $task.Settings.StartWhenAvailable -and $task.Settings.ExecutionTimeLimit.TotalMinutes -eq 20) 'Unexpected task runtime settings.'
+Assert-True ($task.Settings.MultipleInstances -eq 'IgnoreNew' -and $task.Settings.StartWhenAvailable -and $task.Settings.ExecutionTimeLimit.TotalMinutes -eq 120) 'Unexpected task runtime settings; Edge runs require a 120-minute task budget.'
 Assert-True ($task.Actions[0].WorkingDirectory -eq $projectRoot -and -not $task.WasForced) 'Unexpected working directory or overwrite.'
 $expectedArguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $projectRoot 'Run-Daily.ps1')
 Assert-True ($task.Actions[0].Arguments -ceq $expectedArguments) 'Runner path is not quoted as expected.'
