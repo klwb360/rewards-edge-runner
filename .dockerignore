@@ -1,0 +1,15 @@
+.git
+.venv
+.state
+.logs
+.codex-remote-attachments
+__pycache__
+**/__pycache__
+*.pyc
+PROJECT_STATUS.md
+docs/checkpoints
+searches.txt
+.env
+.env.*
+*.pem
+*.key
