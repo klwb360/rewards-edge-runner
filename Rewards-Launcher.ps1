@@ -35,6 +35,13 @@ function Invoke-RewardsScript([string]$Name, [string[]]$Arguments = @()) {
     return (Invoke-RewardsProcess $powerShellPath (@('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $path) + $Arguments))
 }
 
+function ConvertFrom-RewardsJson([string]$Json) {
+    $parameters = @{ ErrorAction = 'Stop' }
+    # New PowerShell versions otherwise convert ISO strings to host-local DateTime.
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { $parameters['DateKind'] = 'String' }
+    return ($Json | ConvertFrom-Json @parameters)
+}
+
 function Get-RewardsRunReport {
     $logsPath = Join-Path $script:RewardsRoot '.logs'
     if (-not (Test-Path -LiteralPath $logsPath -PathType Container)) { return $null }
@@ -43,7 +50,7 @@ function Get-RewardsRunReport {
         $fileTime = [datetime]::MinValue
         if (-not [datetime]::TryParseExact($file.BaseName, [string[]]@('yyyyMMdd-HHmmss-ffffff', 'yyyyMMdd-HHmmss'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$fileTime)) { continue }
         try {
-            $data = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json -ErrorAction Stop
+            $data = ConvertFrom-RewardsJson ([IO.File]::ReadAllText($file.FullName))
             $startedAt = [DateTimeOffset]::MinValue
             if ($data.command -ne 'run' -or -not ($data.tasks -is [array]) -or
                 [string]::IsNullOrWhiteSpace($data.status) -or
@@ -66,11 +73,46 @@ function Format-RewardsCompletion($Value) {
     return '未完成'
 }
 
+function Invoke-RewardsReportContext([string]$FilePath, [string[]]$Arguments) {
+    # The read-only helper receives argv values directly, without a command shell.
+    $output = @(& $FilePath @Arguments 2>$null)
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output -join [Environment]::NewLine) }
+}
+
+function Get-RewardsReportTime([DateTimeOffset]$StartedAt) {
+    $pythonPath = Join-Path $script:RewardsRoot '.venv\Scripts\python.exe'
+    $runtimePath = Join-Path $script:RewardsRoot 'runtime_context.py'
+    $configPath = Join-Path $script:RewardsRoot 'config.json'
+    foreach ($path in @($pythonPath, $runtimePath, $configPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    }
+    try {
+        $result = Invoke-RewardsReportContext $pythonPath @($runtimePath, '--config', $configPath, '--report-start', $StartedAt.ToString('o'))
+        if ($result.ExitCode -ne 0) { return $null }
+        $context = ConvertFrom-RewardsJson $result.Output
+        $converted = [DateTimeOffset]::MinValue
+        $now = [DateTimeOffset]::MinValue
+        if ($context.started_at -isnot [string] -or $context.now -isnot [string] -or
+            $context.started_at -notmatch '(?:Z|[+-]\d{2}:\d{2})$' -or $context.now -notmatch '(?:Z|[+-]\d{2}:\d{2})$' -or
+            -not [DateTimeOffset]::TryParse($context.started_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$converted) -or
+            -not [DateTimeOffset]::TryParse($context.now, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$now) -or
+            [Math]::Abs($converted.UtcDateTime.Ticks - $StartedAt.UtcDateTime.Ticks) -ge 10) { return $null }
+        return [pscustomobject]@{ StartedAt = $converted; Now = $now }
+    }
+    catch { return $null }
+}
+
 function Write-RewardsRunReport($Report) {
     $data = $Report.Data
-    Write-Host ('运行时间：{0}' -f $Report.StartedAt.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz'))
+    $reportTime = Get-RewardsReportTime $Report.StartedAt
+    $displayTime = $Report.StartedAt
+    if ($null -ne $reportTime) { $displayTime = $reportTime.StartedAt }
+    Write-Host ('运行时间：{0}' -f $displayTime.ToString('yyyy-MM-dd HH:mm:ss zzz'))
     Write-Host ('报告文件：{0}' -f $Report.Path)
-    if ($Report.StartedAt.LocalDateTime.Date -ne (Get-Date).Date) {
+    if ($null -eq $reportTime) {
+        Write-Host '注意：报告时区未核验，当前显示原始记录时间，无法判断是否为今天的任务状态。请用 doctor 检查环境与配置。' -ForegroundColor Yellow
+    }
+    elseif ($reportTime.StartedAt.Date -ne $reportTime.Now.Date) {
         Write-Host '注意：这是历史运行报告，不能代表今天的任务状态。' -ForegroundColor Yellow
     }
     $labels = @{
@@ -147,12 +189,14 @@ function Show-RewardsHelp {
     Write-Host '双击 Rewards.bat 打开中文菜单；命令行用法：Rewards.bat <操作>'
     Write-Host '  setup    安装/更新本地依赖       login    手动登录并保存会话'
     Write-Host '  inspect  检查网页任务           run      执行一次并显示本次报告'
+    Write-Host '  doctor   检查本地环境与配置（不登录、不访问账户）'
     Write-Host '  report   查看最近有效运行报告   logs     打开日志目录'
     Write-Host '  config   编辑配置               guide    打开操作说明'
-    Write-Host '  schedule-install -At 20:00      安排每日自动运行（本机时间）'
+    Write-Host '  schedule-install -At 20:00      安排每日自动运行（配置时区；旧配置沿用本机时间）'
     Write-Host '  schedule-show                  查看定时任务'
     Write-Host '  schedule-remove                移除本目录的定时任务'
     Write-Host '命令行操作不会暂停；只有中文菜单等待输入。定时运行需要 Windows 开机且当前用户已登录。'
+    Write-Host '退出码 130（Ctrl+C）或 143（SIGTERM）均表示运行已中断，可用 report 查看已保存的进度。'
 }
 
 function Invoke-RewardsAction([string]$Action, [string]$At) {
@@ -178,11 +222,12 @@ function Invoke-RewardsAction([string]$Action, [string]$At) {
             if ($At -notmatch '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$') { throw '时间格式应为 HH:mm，例如 20:00。' }
             return (Invoke-RewardsScript 'Schedule.ps1' @('-Action', $scheduleAction, '-At', $At))
         }
-        { $_ -in @('login', 'inspect', 'run') } {
+        { $_ -in @('login', 'inspect', 'run', 'doctor') } {
             $pythonPath = Join-Path $script:RewardsRoot '.venv\Scripts\python.exe'
             $mainPath = Join-Path $script:RewardsRoot 'rewards.py'
             if (-not (Test-Path -LiteralPath $mainPath -PathType Leaf)) { throw "主程序不存在：$mainPath" }
             if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+                if ($Action -eq 'doctor') { throw '运行环境缺失，请先执行 Rewards.bat setup，再运行 doctor。' }
                 Write-Host '运行环境缺失，先执行初始化。'
                 $setupCode = Invoke-RewardsScript 'Setup.ps1'
                 if ($setupCode -ne 0) { return $setupCode }
@@ -248,7 +293,7 @@ function Invoke-RewardsLauncher([string]$Action = 'menu', [string]$At = '20:00')
         $code = Invoke-RewardsAction $Action $At
         if ($code -eq 2) { Write-Host '需要手动登录或验证，请执行 Rewards.bat login；程序不会自动重试验证码。' -ForegroundColor Yellow }
         elseif ($code -eq 3) { Write-Host '页面或日期数据发生变化，请查看报告和操作说明。' -ForegroundColor Yellow }
-        elseif ($code -eq 130) { Write-Host '用户已中断本次运行（退出码 130）。请用 Rewards.bat report 查看已保存的进度；程序不会自动重试。' -ForegroundColor Yellow }
+        elseif ($code -in @(130, 143)) { Write-Host ('用户已中断本次运行（退出码 {0}）。请用 Rewards.bat report 查看已保存的进度；程序不会自动重试。' -f $code) -ForegroundColor Yellow }
         elseif ($code -ne 0) { Write-Host '操作未完全成功。环境问题请用 setup，登录问题请用 login，运行结果请用 report 查看。' -ForegroundColor Yellow }
         return [int]$code
     }

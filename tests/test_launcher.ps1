@@ -21,7 +21,7 @@ try {
     foreach ($directory in @('.venv\Scripts', '.logs', 'docs')) { $null = New-Item -ItemType Directory -Path (Join-Path $testRoot $directory) }
     Copy-Item -LiteralPath $launcherPath -Destination (Join-Path $testRoot 'Rewards-Launcher.ps1')
     Copy-Item -LiteralPath (Join-Path $workspaceRoot 'Rewards.bat') -Destination (Join-Path $testRoot 'Rewards.bat')
-    foreach ($name in @('Setup.ps1', 'Schedule.ps1', 'rewards.py', '.venv\Scripts\python.exe', 'config.json', 'docs\OPERATION_GUIDE.md')) {
+    foreach ($name in @('Setup.ps1', 'Schedule.ps1', 'rewards.py', 'runtime_context.py', '.venv\Scripts\python.exe', 'config.json', 'docs\OPERATION_GUIDE.md')) {
         [IO.File]::WriteAllText((Join-Path $testRoot $name), 'throw "Real test backend execution is forbidden"')
     }
     $bytes = [IO.File]::ReadAllBytes($launcherPath)
@@ -38,6 +38,9 @@ try {
     $script:OpenFails = $false
     $script:MenuInputs = New-Object 'Collections.Generic.Queue[string]'
     $script:ReadCount = 0
+    $script:ReportContextExit = 0
+    $script:ReportContextOutput = $null
+    $script:ReportContextCalls = @()
 
     # Every side-effect boundary is replaced. Stub files also throw if accidentally executed.
     function Invoke-RewardsProcess([string]$FilePath, [string[]]$Arguments) {
@@ -56,6 +59,12 @@ try {
         if ($Arguments -contains (Join-Path $testRoot 'Schedule.ps1')) { return $script:ScheduleExit }
         throw 'Unexpected process reached the test boundary.'
     }
+    function Invoke-RewardsReportContext([string]$FilePath, [string[]]$Arguments) {
+        $script:ReportContextCalls += [pscustomobject]@{ File = $FilePath; Args = $Arguments }
+        $output = $script:ReportContextOutput
+        if ($null -eq $output) { $output = @{ started_at = $Arguments[-1]; now = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json }
+        return [pscustomobject]@{ ExitCode = $script:ReportContextExit; Output = $output }
+    }
     function Invoke-Item { param($LiteralPath) if ($script:OpenFails) { throw 'No file association' }; $script:Opened += $LiteralPath }
     function Start-Process { param($FilePath, $ArgumentList) $script:Notepads += [pscustomobject]@{ File = $FilePath; Args = $ArgumentList } }
     function Read-Host { param($Prompt) $script:ReadCount += 1; if ($script:MenuInputs.Count) { return $script:MenuInputs.Dequeue() }; return $null }
@@ -70,20 +79,23 @@ try {
     $env:PYTHONUTF8 = 'before-launcher'
     $env:PYTHONIOENCODING = 'before-launcher'
     Assert-True ((Invoke-Case 'help') -eq 0 -and $script:Calls.Count -eq 0) 'Help started a backend.'
-    foreach ($exitCode in @(0, 1, 2, 3, 130)) {
+    Assert-True ($script:CaseText.Contains('doctor') -and $script:CaseText.Contains('143')) 'Help omitted diagnostics or SIGTERM exit behavior.'
+    foreach ($exitCode in @(0, 1, 2, 3, 130, 143)) {
         $script:PythonExit = $exitCode
         Assert-True ((Invoke-Case 'inspect') -eq $exitCode) 'Python exit code was not propagated.'
         $call = $script:Calls[-1]
         Assert-True ($call.Args[1] -eq 'inspect' -and $call.Directory -eq $testRoot -and $call.Utf8 -eq '1' -and $call.Io -eq 'utf-8') 'Python invocation had incorrect action/cwd/environment.'
+        if ($exitCode -eq 143) { Assert-True ($script:CaseText.Contains('用户已中断本次运行') -and $script:CaseText.Contains('143')) 'SIGTERM lacked the interrupted status and original numeric exit code.' }
     }
     Assert-True ($env:PYTHONUTF8 -eq 'before-launcher' -and $env:PYTHONIOENCODING -eq 'before-launcher') 'Process environment leaked.'
     Assert-True ($script:ReadCount -eq 0) 'A CLI action prompted for input.'
     Write-Output 'PASS: help, numeric exit codes, cwd and environment restore, no CLI pause'
 
-    foreach ($testAction in @('login', 'setup', 'schedule-install', 'schedule-show', 'schedule-remove')) {
+    foreach ($testAction in @('login', 'doctor', 'setup', 'schedule-install', 'schedule-show', 'schedule-remove')) {
         $script:PythonExit = 0
         $beforeCount = $script:Calls.Count
         Assert-True ((Invoke-Case $testAction '09:15') -eq 0 -and $script:Calls.Count -eq ($beforeCount + 1)) ('Routing failed: ' + $testAction)
+        if ($testAction -eq 'doctor') { Assert-True ($script:Calls[-1].Args[1] -eq 'doctor') 'Doctor was not forwarded to the diagnostic CLI.' }
     }
     Assert-True ($script:Calls[-3].Args[-1] -eq '09:15' -and $script:Calls[-3].Args -contains 'Install') 'Schedule arguments were lost.'
     Assert-True ((Invoke-Case 'schedule-install' '24:00') -eq 1) 'Invalid schedule time was accepted.'
@@ -92,6 +104,7 @@ try {
     $script:ScheduleExit = 0
     [IO.File]::Delete((Join-Path $testRoot '.venv\Scripts\python.exe'))
     $beforeCount = $script:Calls.Count
+    Assert-True ((Invoke-Case 'doctor') -eq 1 -and $script:Calls.Count -eq $beforeCount -and $script:CaseText.Contains('setup')) 'Doctor bootstrapped a missing environment instead of reporting it.'
     Assert-True ((Invoke-Case 'inspect') -eq 0 -and $script:Calls.Count -eq ($beforeCount + 2)) 'Missing environment did not bootstrap exactly once.'
     Write-Output 'PASS: runtime/setup/schedule routing and missing-environment bootstrap'
 
@@ -112,6 +125,44 @@ try {
         Assert-True ($script:CaseText.Contains($expected)) ('Report omitted: ' + $expected + '. Captured: ' + $script:CaseText)
     }
     Assert-True (-not $script:CaseText.Contains('Edge 浏览阶段')) 'Legacy report invented an Edge result.'
+
+    # Simulate a Shanghai host day while the configured UTC calendar still has another date.
+    $reportFixture = [pscustomobject]@{ Data = $partial; Path = 'timezone-fixture.json'; StartedAt = [DateTimeOffset]::Parse('2026-10-25T20:00:00Z') }
+    function Get-Date { return [datetime]::Parse('2026-10-26T09:00:00') }
+    $script:ReportContextOutput = '{"started_at":"2026-10-25T20:00:00+00:00","now":"2026-10-26T01:00:00+00:00"}'
+    $reportText = (@(& { Write-RewardsRunReport $reportFixture } 6>&1) | Out-String -Width 4096)
+    Assert-True ($reportText.Contains('2026-10-25 20:00:00 +00:00') -and $reportText.Contains('历史运行报告')) 'UTC previous-day report followed the Shanghai host date or display offset.'
+    $contextCall = $script:ReportContextCalls[-1]
+    Assert-True ($contextCall.File -eq (Join-Path $testRoot '.venv\Scripts\python.exe') -and $contextCall.Args.Count -eq 5 -and
+        $contextCall.Args[0] -eq (Join-Path $testRoot 'runtime_context.py') -and $contextCall.Args[1] -eq '--config' -and
+        $contextCall.Args[2] -eq (Join-Path $testRoot 'config.json') -and $contextCall.Args[3] -eq '--report-start' -and
+        [DateTimeOffset]::Parse($contextCall.Args[4]) -eq $reportFixture.StartedAt) 'Report timezone helper lost its structured arguments.'
+
+    # The inverse offset crossing: different UTC dates can still be the same configured day.
+    $reportFixture.StartedAt = [DateTimeOffset]::Parse('2026-10-25T23:30:00Z')
+    function Get-Date { return [datetime]::Parse('2026-10-26T00:30:00') }
+    $script:ReportContextOutput = '{"started_at":"2026-10-25T16:30:00-07:00","now":"2026-10-25T17:30:00-07:00"}'
+    $reportText = (@(& { Write-RewardsRunReport $reportFixture } 6>&1) | Out-String -Width 4096)
+    Assert-True ($reportText.Contains('2026-10-25 16:30:00 -07:00') -and -not $reportText.Contains('历史运行报告')) 'Same configured day was mislabeled historical across UTC midnight.'
+    Remove-Item Function:\Get-Date
+
+    foreach ($invalidContext in @('{broken', '{}', '{"started_at":"2026-10-25T23:30:00","now":"2026-10-26T01:00:00Z"}')) {
+        $script:ReportContextOutput = $invalidContext
+        $reportText = (@(& { Write-RewardsRunReport $reportFixture } 6>&1) | Out-String -Width 4096)
+        Assert-True ($reportText.Contains('时区未核验') -and -not $reportText.Contains('历史运行报告')) 'Invalid report timezone context produced a verified calendar claim.'
+    }
+    $script:ReportContextExit = 1
+    $reportText = (@(& { Write-RewardsRunReport $reportFixture } 6>&1) | Out-String -Width 4096)
+    Assert-True ($reportText.Contains('时区未核验') -and $reportText.Contains('2026-10-25 23:30:00 +00:00')) 'Failed report helper did not preserve the original timestamp with an unverified warning.'
+    $script:ReportContextExit = 0
+    $script:ReportContextOutput = $null
+    [IO.File]::Delete((Join-Path $testRoot '.venv\Scripts\python.exe'))
+    $beforeCount = $script:Calls.Count
+    $beforeContextCount = $script:ReportContextCalls.Count
+    Assert-True ((Invoke-Case 'report') -eq 0 -and $script:CaseText.Contains('时区未核验') -and
+        $script:Calls.Count -eq $beforeCount -and $script:ReportContextCalls.Count -eq $beforeContextCount) 'Report without a venv hid timezone uncertainty or started a backend.'
+    [IO.File]::WriteAllText((Join-Path $testRoot '.venv\Scripts\python.exe'), 'not executable')
+    Write-Output 'PASS: configured report timezone, opposite date crossings and explicit unverified fallback'
     $script:PythonExit = 3
     Assert-True ((Invoke-Case 'run') -eq 3 -and $script:CaseText.Contains('本次没有生成') -and -not $script:CaseText.Contains('运行状态：')) 'Failed run reused historical success as its current result.'
     $script:NewReport = $partial.Clone(); $script:NewReport.started_at = [DateTimeOffset]::Now.ToString('o'); $script:NewReport.status = 'search_paused'; $script:NewReport.searches = @{ opened = 2; requested = 20; skipped_today = 0; credit = 'unverified'; quota_before = @{ current = 57; maximum = 60 }; quota_after = @{ current = 57; maximum = 60 }; observed_points_gained = 0; stopped_reason = 'no_credit' }
@@ -125,6 +176,7 @@ try {
         @{ Status = 'timeout'; Before = 5; After = 5; CompletedBefore = $false; CompletedAfter = $false; Waited = 3600; Code = 1; Top = 'partial'; Label = '等待达到上限，页面仍未确认完成' },
         @{ Status = 'unavailable'; Before = $null; After = $null; CompletedBefore = $null; CompletedAfter = $null; Waited = 0; Code = 1; Top = 'partial'; Label = '当前页面未提供此任务' },
         @{ Status = 'interrupted'; Before = 5; After = 10; CompletedBefore = $false; CompletedAfter = $false; Waited = 300; Code = 130; Top = 'interrupted'; Label = '用户已中断，未确认完成' },
+        @{ Status = 'interrupted'; Before = 5; After = 10; CompletedBefore = $false; CompletedAfter = $false; Waited = 300; Code = 143; Top = 'interrupted'; Label = '用户已中断，未确认完成' },
         @{ Status = 'error'; Before = 5; After = 5; CompletedBefore = $false; CompletedAfter = $false; Waited = 10; Code = 1; Top = 'partial'; Label = '阶段运行出错，未确认完成' }
     )
     foreach ($edgeCase in $edgeCases) {
@@ -142,9 +194,9 @@ try {
             Assert-True ($script:CaseText.Contains($progressText)) 'Edge page progress was omitted or inferred from elapsed time.'
         }
         if ($edgeCase.Status -eq 'timeout') { Assert-True ($script:CaseText.Contains('未完成 → 未完成')) 'Timed-out task was reported as completed.' }
-        if ($edgeCase.Code -eq 130) { Assert-True ($script:CaseText.Contains('用户已中断本次运行')) 'Interrupted CLI lacked an actionable message.' }
+        if ($edgeCase.Code -in @(130, 143)) { Assert-True ($script:CaseText.Contains('用户已中断本次运行') -and $script:CaseText.Contains([string]$edgeCase.Code)) 'Interrupted CLI lacked an actionable message or numeric code.' }
     }
-    Write-Output 'PASS: Edge stage results, actual page progress, timeout and interrupted exit 130'
+    Write-Output 'PASS: Edge stage results, actual page progress, timeout and interrupted exits 130/143'
 
     foreach ($testAction in @('config', 'guide', 'logs')) { Assert-True ((Invoke-Case $testAction) -eq 0) ('Open action failed: ' + $testAction) }
     Assert-True ($script:Opened.Count -eq 3) 'Open actions were not routed.'
@@ -166,9 +218,9 @@ try {
     Assert-True ($probeExit -eq 7 -and $probe.value -eq 'argument with spaces & !' -and $probe.cwd -eq $testRoot) 'Real process arguments/cwd/exit code were damaged.'
 
     # Only the BAT copy is exercised here. Its PS backend is replaced with a harmless recorder.
-    $fakeBackend = 'param([string]$Action="menu",[string]$At="20:00"); [IO.File]::WriteAllText((Join-Path $PSScriptRoot "bat-args.json"), (@{ action=$Action; at=$At; root=$PSScriptRoot } | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))); if ($Action -eq "run" -and $At -eq "13:00") { exit 130 }; if ($Action -eq "run") { exit 3 }; exit 0'
+    $fakeBackend = 'param([string]$Action="menu",[string]$At="20:00"); [IO.File]::WriteAllText((Join-Path $PSScriptRoot "bat-args.json"), (@{ action=$Action; at=$At; root=$PSScriptRoot } | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))); if ($Action -eq "run" -and $At -eq "13:00") { exit 130 }; if ($Action -eq "run" -and $At -eq "14:30") { exit 143 }; if ($Action -eq "run") { exit 3 }; exit 0'
     [IO.File]::WriteAllText((Join-Path $testRoot 'Rewards-Launcher.ps1'), $fakeBackend, (New-Object Text.UTF8Encoding($true)))
-    foreach ($case in @(@{ Tail = ' run -At 09:15'; Action = 'run'; At = '09:15'; Code = 3 }, @{ Tail = ' run -At 13:00'; Action = 'run'; At = '13:00'; Code = 130 }, @{ Tail = ' help'; Action = 'help'; At = '20:00'; Code = 0 }, @{ Tail = ''; Action = 'menu'; At = '20:00'; Code = 0 })) {
+    foreach ($case in @(@{ Tail = ' run -At 09:15'; Action = 'run'; At = '09:15'; Code = 3 }, @{ Tail = ' run -At 13:00'; Action = 'run'; At = '13:00'; Code = 130 }, @{ Tail = ' run -At 14:30'; Action = 'run'; At = '14:30'; Code = 143 }, @{ Tail = ' help'; Action = 'help'; At = '20:00'; Code = 0 }, @{ Tail = ''; Action = 'menu'; At = '20:00'; Code = 0 })) {
         $info = New-Object Diagnostics.ProcessStartInfo
         $info.FileName = $env:ComSpec
         $info.Arguments = '/d /v:off /s /c ""' + (Join-Path $testRoot 'Rewards.bat') + '"' + $case.Tail + '"'

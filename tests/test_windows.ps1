@@ -9,6 +9,10 @@ $script:MockGuard = $true
 $script:TaskWrites = 0
 $script:ExistingTask = @()
 $script:Registration = $null
+$script:ContextOutput = '{"timezone":null,"start_boundary":null}'
+$script:ContextExit = 0
+$script:ContextCalls = @()
+$script:TriggerHostIsUtc = $false
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -28,6 +32,10 @@ $importLine = 'Import-Module ScheduledTasks -ErrorAction Stop'
 Assert-True ($scheduleSource.Contains($importLine)) 'Scheduling import changed; review test isolation before continuing.'
 $scheduleSource = $scheduleSource.Replace($importLine, '# ScheduledTasks import blocked by isolated test harness')
 Assert-True ($scheduleSource -notmatch '(?im)^\s*Import-Module\b|(?i:ScheduledTasks\\)') 'Unexpected module import or qualified task command.'
+$contextCall = '$contextOutput = @(& $pythonPath $runtimePath --config $configPath --at $At)'
+Assert-True ($scheduleSource.Contains($contextCall)) 'Scheduler must read validated timezone configuration through the isolated Python boundary.'
+$scheduleSource = $scheduleSource.Replace($contextCall, '$contextOutput = @(Invoke-MockedSchedulePython $pythonPath @($runtimePath, ''--config'', $configPath, ''--at'', $At)); $LASTEXITCODE = $script:ContextExit')
+Assert-True ($scheduleSource -notmatch '&\s*\$pythonPath') 'Actual schedule Python invocation escaped isolation.'
 $quotedRoot = "'" + $projectRoot.Replace("'", "''") + "'"
 $scheduleSource = $scheduleSource.Replace('$PSScriptRoot', $quotedRoot).Replace('exit 1', 'throw')
 $isolatedSchedule = [ScriptBlock]::Create($scheduleSource)
@@ -39,6 +47,12 @@ function Import-Module { throw 'Module imports are forbidden in this test harnes
 function Test-Path { param($LiteralPath, $PathType) Assert-MockGuard; return $true }
 function Get-ScheduledTask { param($TaskPath) Assert-MockGuard; return $script:ExistingTask }
 function Get-ScheduledTaskInfo { throw 'Unexpected task-info access in isolated tests.' }
+function Invoke-MockedSchedulePython {
+    param($FilePath, $Arguments)
+    Assert-MockGuard
+    $script:ContextCalls += [pscustomobject]@{ File = $FilePath; Args = $Arguments }
+    return $script:ContextOutput
+}
 function New-ScheduledTaskAction {
     param($Execute, $Argument, $WorkingDirectory)
     Assert-MockGuard
@@ -48,7 +62,9 @@ function New-ScheduledTaskTrigger {
     param([switch]$Daily, [datetime]$At)
     Assert-MockGuard
     Assert-True $Daily.IsPresent 'Expected a daily trigger.'
-    return [pscustomobject]@{ DaysInterval = 1; StartBoundary = $At.ToUniversalTime().ToString('o') }
+    if ($script:TriggerHostIsUtc) { $boundary = [datetime]::SpecifyKind($At, [DateTimeKind]::Utc).ToString('o') }
+    else { $boundary = $At.ToUniversalTime().ToString('o') }
+    return [pscustomobject]@{ DaysInterval = 1; StartBoundary = $boundary }
 }
 function New-ScheduledTaskPrincipal {
     param($UserId, $LogonType, $RunLevel)
@@ -137,6 +153,51 @@ try { & $isolatedSchedule -Action Install -At '24:00' 2>$null | Out-Null }
 catch { $refused = $true }
 Assert-True ($refused -and $script:TaskWrites -eq 3) 'Invalid schedule time was not refused.'
 Write-Output 'PASS: invalid time refusal'
+
+$script:ExistingTask = @()
+$script:TriggerHostIsUtc = $true
+$script:ContextOutput = '{"timezone":"Asia/Shanghai","start_boundary":"2026-10-25T20:00:00+08:00"}'
+Assert-MockBindings
+& $isolatedSchedule -Action Install | Out-Null
+Assert-True ($script:TaskWrites -eq 4 -and $script:Registration.Triggers[0].StartBoundary -ceq '2026-10-25T20:00:00+08:00') 'Shanghai 20:00 followed the mocked UTC host instead of config timezone.'
+$instant = [DateTimeOffset]::Parse($script:Registration.Triggers[0].StartBoundary)
+Assert-True ($instant.UtcDateTime.Hour -eq 12 -and $instant.Offset.TotalHours -eq 8) 'Configured 20:00 did not represent noon UTC.'
+$contextCall = $script:ContextCalls[-1]
+Assert-True ($contextCall.File -eq (Join-Path $projectRoot '.venv\Scripts\python.exe') -and $contextCall.Args.Count -eq 5 -and
+    $contextCall.Args[0] -eq (Join-Path $projectRoot 'runtime_context.py') -and $contextCall.Args[1] -eq '--config' -and
+    $contextCall.Args[2] -eq (Join-Path $projectRoot 'config.json') -and $contextCall.Args[3] -eq '--at' -and $contextCall.Args[4] -eq '20:00') 'Timezone helper arguments were not separate structured values.'
+Write-Output 'PASS: configured Shanghai 20:00 with a UTC host and structured Python arguments'
+
+$script:ContextOutput = '{"timezone":null,"start_boundary":null}'
+& $isolatedSchedule -Action Install -At '09:30' | Out-Null
+Assert-True ($script:TaskWrites -eq 5 -and $script:Registration.Triggers[0].StartBoundary -match 'T09:30:00(?:\.0+)?Z$') 'Legacy missing-timezone configuration stopped using the host-local trigger.'
+Write-Output 'PASS: legacy local-time compatibility'
+
+foreach ($invalidContext in @(
+    '{broken', '{}', '[]',
+    '{"timezone":"Asia/Shanghai","start_boundary":null}',
+    '{"timezone":null,"start_boundary":"2026-10-25T20:00:00+08:00"}',
+    '{"timezone":"Asia/Shanghai","start_boundary":"2026-10-25T20:00:00"}',
+    '{"timezone":"Asia/Shanghai","start_boundary":"2026-10-25T09:30:00+08:00"}'
+)) {
+    $script:ContextOutput = $invalidContext
+    $refused = $false
+    try { & $isolatedSchedule -Action Install 2>$null | Out-Null }
+    catch { $refused = $true }
+    Assert-True ($refused -and $script:TaskWrites -eq 5) 'Malformed timezone context was accepted or changed a task.'
+}
+$script:ContextOutput = ''
+$script:ContextExit = 1
+$refused = $false
+try { & $isolatedSchedule -Action Install 2>$null | Out-Null }
+catch { $refused = $_.Exception.Message -match 'timezone configuration' }
+Assert-True ($refused -and $script:TaskWrites -eq 5) 'Timezone/config read failure did not stop task registration.'
+$beforeContextCalls = $script:ContextCalls.Count
+& $isolatedSchedule -Action Show | Out-Null
+& $isolatedSchedule -Action Remove | Out-Null
+Assert-True ($script:ContextCalls.Count -eq $beforeContextCalls -and $script:TaskWrites -eq 5) 'Showing/removing an absent task required a readable runtime config.'
+$script:ContextExit = 0
+Write-Output 'PASS: malformed timezone context and failed config reads refuse all scheduler writes'
 
 $runnerCall = '& $pythonPath $scriptPath run'
 Assert-True ($runnerSource.Contains($runnerCall)) 'Runner call changed; review process isolation.'
